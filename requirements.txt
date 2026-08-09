@@ -1,7 +1,9 @@
-fastapi
-uvicorn
-langgraph
+streamlit
+langchain
+langchain-community
 langchain-core
 langchain-google-genai
+langchain-experimental
+langchain-text-splitters
+faiss-cpu
 google-generativeai
-pydantic
