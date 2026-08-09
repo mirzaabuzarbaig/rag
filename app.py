@@ -1,376 +1,240 @@
-import sys
-import io
-import traceback
 import os
+import streamlit as st
 
-from typing import TypedDict, List, Optional
-
-from langchain_core.messages import BaseMessage, HumanMessage
-from langchain_core.tools import tool
-from langgraph.graph import StateGraph, START, END
-from langchain_google_genai import ChatGoogleGenerativeAI
-
-from fastapi import FastAPI
-from pydantic import BaseModel
-
-
-# ==========================================
-# 1. LLM INITIALIZATION
-# ==========================================
-
-import google.generativeai as genai
-
-api_key = os.environ["GOOGLE_API_KEY"]
-
-genai.configure(api_key=api_key)
-
-llm_flash = ChatGoogleGenerativeAI(
-    model="gemini-3.1-flash-lite-preview",
-    google_api_key=api_key
+from langchain_google_genai import (
+    ChatGoogleGenerativeAI,
+    GoogleGenerativeAIEmbeddings
 )
 
-llm = llm_flash
+from langchain_core.documents import Document
+from langchain_experimental.text_splitter import SemanticChunker
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 
 
-# ==========================================
-# 2. STATE DEFINITION
-# ==========================================
+# ---------------------------------------------------------
+# PAGE CONFIGURATION
+# ---------------------------------------------------------
 
-class CrewState(TypedDict):
-    messages: List[BaseMessage]
-    next_step: Optional[str]
-    code: Optional[str]
-    report: Optional[str]
-    user_task: Optional[str]
-    manager_command: Optional[str]
+st.set_page_config(
+    page_title="InnovateCorp RAG Assistant",
+    page_icon="🤖",
+    layout="centered"
+)
 
-
-# ==========================================
-# 3. TOOLS
-# ==========================================
-
-@tool
-def run_python_code(code: str) -> str:
-    """Execute python code and return the standard output or error trace."""
-
-    if not isinstance(code, str):
-        code = str(code)
-
-    clean_code = code.replace("```python", "").replace("```", "").strip()
-
-    old_stdout = sys.stdout
-    new_stdout = io.StringIO()
-    sys.stdout = new_stdout
-
-    try:
-        local_scope = {}
-
-        exec(clean_code, {}, local_scope)
-
-        result = new_stdout.getvalue()
-
-    except Exception:
-        result = f"Execution Error:\n{traceback.format_exc()}"
-
-    finally:
-        sys.stdout = old_stdout
-
-    return result.strip() if result.strip() else "Success (no terminal output)"
+st.title("🤖 InnovateCorp RAG Assistant")
+st.write("Ask questions about the InnovateCorp Knowledge Transfer Guide.")
 
 
-@tool
-def generate_test_cases(task_description: str) -> str:
-    """Generate specific test scenarios for a given coding task."""
+# ---------------------------------------------------------
+# API KEY
+# ---------------------------------------------------------
 
-    prompt = (
-        f"You are a Senior QA Engineer. Generate 3 to 5 highly specific "
-        f"test scenarios for the following coding task: '{task_description}'.\n"
-        f"Include standard cases and edge cases. Return them as a numbered list."
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+if not GOOGLE_API_KEY:
+    st.error("GOOGLE_API_KEY is not configured.")
+    st.stop()
+
+
+# ---------------------------------------------------------
+# INITIALIZE GEMINI
+# ---------------------------------------------------------
+
+@st.cache_resource
+def initialize_models():
+
+    embeddings = GoogleGenerativeAIEmbeddings(
+        model="models/gemini-embedding-001",
+        google_api_key=GOOGLE_API_KEY
     )
 
-    response = llm.invoke(prompt)
-
-    return response.content if hasattr(response, "content") else str(response)
-
-
-# ==========================================
-# 4. GRAPH NODES
-# ==========================================
-
-def task_input_node(state: CrewState):
-
-    print("\n" + "=" * 50)
-    print("--- NEW TASK INITIALIZATION ---")
-
-    # Web request supplies the task instead of terminal input
-    user_task = state.get("user_task", "").strip()
-
-    if user_task.lower() == "exit":
-        return {"next_step": "exit"}
-
-    return {
-        "messages": [HumanMessage(content=user_task)],
-        "next_step": "developer"
-    }
-
-
-def real_time_developer(state: CrewState):
-
-    print("\n[Developer] Writing dynamic code using LLM...")
-
-    task = state["messages"][-1].content
-
-    dev_prompt = (
-        f"Write a clean Python script to solve this: {task}. "
-        f"Only return the code, no explanation or markdown formatting."
+    llm = ChatGoogleGenerativeAI(
+        model="models/gemma-4-31b-it",
+        google_api_key=GOOGLE_API_KEY
     )
 
-    if llm_flash is None:
-        raise ValueError(
-            "LLM is not initialized. Please set up 'llm_flash'."
-        )
-
-    response = llm_flash.invoke(dev_prompt)
-
-    content = response.content
-
-    if isinstance(content, list):
-        code_str = (
-            content[0].get("text", "")
-            if isinstance(content[0], dict)
-            else str(content[0])
-        )
-    else:
-        code_str = str(content)
-
-    print(code_str)
-
-    return {"code": code_str}
+    return embeddings, llm
 
 
-def real_time_tester(state: CrewState):
+embeddings, llm = initialize_models()
 
-    print("\n[Tester] Generating dynamic tests and executing code...")
 
-    task = state["messages"][-1].content
+# ---------------------------------------------------------
+# INNOVATECORP KT GUIDE
+# ---------------------------------------------------------
 
-    # Generate tests
-    test_cases = generate_test_cases.invoke(task)
+kt_guide_content = """
+Welcome to InnovateCorp! This Knowledge Transfer (KT) guide is designed to help new employees navigate their initial weeks and understand key aspects of our operations. Our core values are Innovation, Collaboration, and Customer Focus.
 
-    content = test_cases
+**Team Structure:** You will be joining the 'Project Alpha' team, reporting to Sarah Chen, the Senior Project Manager. Your direct teammates include David Lee (Lead Developer), Maria Rodriguez (UI/UX Designer), and Tom Jackson (QA Engineer). Our team meetings are held every Monday at 10 AM in Conference Room 3, and daily stand-ups are at 9:30 AM via Google Meet.
 
-    if isinstance(content, list):
-        cases_str = (
-            content[0].get("text", "")
-            if isinstance(content[0], dict)
-            else str(content[0])
-        )
-    else:
-        cases_str = str(content)
+**Key Tools & Software:** For project management, we use Jira for task tracking and Confluence for documentation. Our primary communication tool is Slack for instant messaging and Google Workspace for email and calendars. Development work is primarily done using Python and JavaScript, with code hosted on GitHub. Access to these tools will be granted within your first three days.
 
-    # Execute code
-    execution_result = run_python_code.invoke(
-        {"code": state["code"]}
+**Onboarding Process:** Your first week will focus on setup and introductions. You'll receive your laptop and login credentials on day one. HR will conduct an orientation session on Tuesday covering company policies, benefits, and payroll. You'll have one-on-one meetings with your team members throughout the week. By the end of your second week, you should have access to all necessary systems and have completed mandatory compliance training modules.
+
+**Important Resources:** The company's internal knowledge base can be found at `internal.innovatecorp.com/kb`. This includes FAQs, best practices, and troubleshooting guides. For IT support, please submit a ticket via `support.innovatecorp.com` or call extension 5555. Health and wellness benefits information is available on the HR portal.
+
+**Culture & Expectations:** InnovateCorp encourages a proactive and collaborative environment. We value open communication and continuous learning. Don't hesitate to ask questions; your team is here to support your growth. Performance reviews are conducted quarterly, and professional development courses are available through our 'InnovateLearn' platform.
+"""
+
+
+# ---------------------------------------------------------
+# CREATE DOCUMENT
+# ---------------------------------------------------------
+
+@st.cache_resource
+def create_vector_store():
+
+    kt_documents = [
+        Document(page_content=kt_guide_content)
+    ]
+
+    # Semantic chunking
+    semantic_splitter = SemanticChunker(
+        embeddings
     )
 
-    # Compile Report
-    report = (
-        f"### EXECUTION OUTPUT:\n"
-        f"{execution_result}\n\n"
-        f"### TEST SCENARIOS EVALUATED:\n"
-        f"{cases_str}"
+    kt_semantic_chunks = semantic_splitter.create_documents(
+        [kt_guide_content]
     )
 
-    return {"report": report}
-
-
-def manager_decision_node(state: CrewState):
-
-    print("\n" + "=" * 50)
-    print("--- MANAGER DASHBOARD : TEST REPORT ---")
-
-    print(
-        state.get(
-            "report",
-            "No report available."
-        )
+    # Create FAISS vector store
+    vector_store = FAISS.from_documents(
+        kt_semantic_chunks,
+        embeddings
     )
 
-    print("=" * 50)
-
-    # Web request supplies the command
-    user_input = state.get(
-        "manager_command",
-        "store"
-    ).lower().strip()
-
-    if user_input == "store":
-        return {"next_step": "archiver"}
-
-    else:
-        return {"next_step": "task_input"}
+    return vector_store
 
 
-def archiver_node(state: CrewState):
-
-    print("\n[Archiver] Task stored successfully. Closing workflow.")
-
-    return {"next_step": "exit"}
+vector_store = create_vector_store()
 
 
-# ==========================================
-# 5. GRAPH CONSTRUCTION & ROUTING
-# ==========================================
+# ---------------------------------------------------------
+# RETRIEVER
+# ---------------------------------------------------------
 
-rt_workflow = StateGraph(CrewState)
-
-rt_workflow.add_node(
-    "task_input",
-    task_input_node
-)
-
-rt_workflow.add_node(
-    "developer",
-    real_time_developer
-)
-
-rt_workflow.add_node(
-    "tester",
-    real_time_tester
-)
-
-rt_workflow.add_node(
-    "manager_decision",
-    manager_decision_node
-)
-
-rt_workflow.add_node(
-    "archiver",
-    archiver_node
+retriever = vector_store.as_retriever(
+    search_kwargs={"k": 2}
 )
 
 
-rt_workflow.add_edge(
-    START,
-    "task_input"
+# ---------------------------------------------------------
+# RAG PROMPT
+# ---------------------------------------------------------
+
+rag_prompt = ChatPromptTemplate.from_template(
+    """
+You are an HR assistant for InnovateCorp using the company's
+Knowledge Transfer guide.
+
+Use ONLY the retrieved context below to answer the user's question.
+
+If the answer is not available in the context, politely explain
+that you don't know or that the information is not available
+in the manual.
+
+Do not invent information.
+
+Retrieved Context:
+{context}
+
+Question:
+{question}
+
+Answer:
+"""
 )
 
 
-def route_from_input(state):
+# ---------------------------------------------------------
+# FORMAT DOCUMENTS
+# ---------------------------------------------------------
 
-    if state.get("next_step") == "exit":
-        return END
+def format_docs(docs):
 
-    return "developer"
-
-
-rt_workflow.add_conditional_edges(
-    "task_input",
-    route_from_input
-)
+    return "\n\n".join(
+        f"Content: {doc.page_content}"
+        for doc in docs
+    )
 
 
-# Sequential flow
+# ---------------------------------------------------------
+# RAG FUNCTION
+# ---------------------------------------------------------
 
-rt_workflow.add_edge(
-    "developer",
-    "tester"
-)
+def ask_rag(question):
 
-rt_workflow.add_edge(
-    "tester",
-    "manager_decision"
-)
+    retrieved_docs = retriever.invoke(question)
 
+    context = format_docs(retrieved_docs)
 
-def route_from_decision(state):
+    rag_chain = (
+        rag_prompt
+        | llm
+        | StrOutputParser()
+    )
 
-    if state.get("next_step") == "archiver":
-        return "archiver"
-
-    return "task_input"
-
-
-rt_workflow.add_conditional_edges(
-    "manager_decision",
-    route_from_decision
-)
-
-rt_workflow.add_edge(
-    "archiver",
-    END
-)
-
-
-rt_app = rt_workflow.compile()
-
-print(
-    "Interactive pipeline compiled and ready for live execution."
-)
-
-
-# ==========================================
-# 6. FASTAPI WEB SERVICE
-# ==========================================
-
-app = FastAPI(
-    title="LangGraph Coding Agent"
-)
-
-
-class TaskRequest(BaseModel):
-    task: str
-    command: str = "store"
-
-
-@app.get("/")
-def home():
-
-    return {
-        "message": "LangGraph Coding Agent is running"
-    }
-
-
-@app.post("/run")
-def run_langgraph(request: TaskRequest):
-
-    state = {
-        "messages": [],
-        "next_step": None,
-        "code": None,
-        "report": None,
-        "user_task": request.task,
-        "manager_command": request.command
-    }
-
-    result = rt_app.invoke(
-        state,
-        config={
-            "recursion_limit": 50
+    answer = rag_chain.invoke(
+        {
+            "context": context,
+            "question": question
         }
     )
 
-    return {
-        "code": result.get("code"),
-        "report": result.get("report"),
-        "next_step": result.get("next_step")
-    }
+    return answer
 
 
-# ==========================================
-# 7. START SERVER
-# ==========================================
+# ---------------------------------------------------------
+# CHAT INTERFACE
+# ---------------------------------------------------------
 
-if __name__ == "__main__":
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-    import uvicorn
 
-    port = int(
-        os.environ.get("PORT", 8000)
+# Display previous messages
+for message in st.session_state.messages:
+
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+
+# User input
+question = st.chat_input(
+    "Ask something about InnovateCorp..."
+)
+
+
+if question:
+
+    # Display user question
+    st.session_state.messages.append(
+        {
+            "role": "user",
+            "content": question
+        }
     )
 
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=port
+    with st.chat_message("user"):
+        st.markdown(question)
+
+
+    # Generate answer
+    with st.chat_message("assistant"):
+
+        with st.spinner("Searching the knowledge base..."):
+
+            answer = ask_rag(question)
+
+        st.markdown(answer)
+
+
+    st.session_state.messages.append(
+        {
+            "role": "assistant",
+            "content": answer
+        }
     )
